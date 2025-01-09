@@ -3,176 +3,317 @@
 # Exit immediately if a command exits with a non-zero status
 set -e
 
-# Trap errors and display a message
-trap 'echo "An error occurred during the execution of the script. Exiting..."; exit 1' ERR
+# Configuration variables
+readonly SSSD_CONF="/etc/sssd/sssd.conf"
+readonly SSH_CONF="/etc/ssh/sshd_config"
+readonly PAM_SSHD="/etc/pam.d/sshd"
+readonly PAM_SYSTEM_AUTH="/etc/pam.d/system-auth"
 
-echo "Starting LDAP SSO configuration..."
+# Package lists for different package managers
+declare -A PACKAGES
+PACKAGES[apt]="ldap-utils openssh-client openssh-server sssd sssd-ldap sudo libnss-sss libpam-sss ca-certificates vim net-tools iputils-ping"
+PACKAGES[yum]="openssh-clients openssh-server sssd sssd-ldap sudo openldap-clients ca-certificates vim net-tools iputils authselect authconfig"
+PACKAGES[pacman]="openssh sssd openldap sudo ca-certificates vim net-tools iputils pam pambase"
 
-# Function to determine BASE_DN based on the domain
-function get_base_dn() {
-    domain=$(hostname -d)
-    IFS='.' read -ra ADDR <<< "$domain"
-    for i in "${ADDR[@]}"; do
-        BASE_DN+="dc=$i,"
-    done
-    BASE_DN=${BASE_DN::-1}
-    echo $BASE_DN
+# Function to log messages
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
 }
 
 # Function to detect package manager
-function detect_package_manager() {
-    if command -v apt-get >/dev/null 2>&1; then
-        echo "apt"
-    elif command -v yum >/dev/null 2>&1; then
-        echo "yum"
-    elif command -v pacman >/dev/null 2>&1; then
-        echo "pacman"
+detect_package_manager() {
+    local package_managers=("apt-get:apt" "yum:yum" "pacman:pacman")
+    
+    for pm in "${package_managers[@]}"; do
+        IFS=':' read -r cmd name <<< "$pm"
+        if command -v "$cmd" >/dev/null 2>&1; then
+            echo "$name"
+            return 0
+        fi
+    done
+    
+    log "Error: Unsupported package manager"
+    exit 1
+}
+
+# Function to detect OS and version
+detect_os_version() {
+    if [ -f /etc/arch-release ]; then
+        echo "arch-linux"
+    elif [ -f /etc/os-release ]; then
+        . /etc/os-release
+        echo "$ID-$VERSION_ID"
     else
-        echo "Unsupported package manager. Exiting."
-        exit 1
+        echo "unknown"
     fi
 }
 
-# Install necessary packages based on the package manager
-function install_packages() {
+# Function to install packages based on package manager
+install_packages() {
+    local package_manager=$1
+    log "Installing packages with $package_manager..."
+    
+    case $package_manager in
+        apt)
+            export DEBIAN_FRONTEND=noninteractive
+            sudo apt-get update
+            sudo apt-get install -y ${PACKAGES[apt]}
+            sudo rm -rf /var/lib/apt/lists/*
+            unset DEBIAN_FRONTEND
+            ;;
+        yum)
+            sudo yum install -y ${PACKAGES[yum]}
+            ;;
+        pacman)
+            setup_pacman_keyring
+            sudo pacman -Syy --noconfirm
+            printf 'y\n' | sudo pacman -S --needed base-devel
+            for package in ${PACKAGES[pacman]}; do
+                sudo pacman -S --noconfirm --needed "$package"
+            done
+            sudo pacman -Sc --noconfirm
+            ;;
+    esac
+}
+
+setup_pacman_keyring() {
+    log "Setting up pacman keyring..."
+    sudo mkdir -p /etc/pacman.d/gnupg
+    sudo chmod 700 /etc/pacman.d/gnupg
+    sudo pacman-key --init
+    sudo pacman-key --populate archlinux
+}
+
+# Function to set up SSH
+setup_ssh() {
+    log "Setting up SSH..."
+    sudo mkdir -p /var/run/sshd
+    
+    # Configure SSH
+    configure_ssh_authentication
+    generate_ssh_keys
+    
+    # Start and enable SSH service
+    local service_name="ssh"
+    [[ "$PACKAGE_MANAGER" =~ ^(yum|pacman)$ ]] && service_name="sshd"
+    
+    sudo systemctl enable "$service_name"
+    sudo systemctl restart "$service_name"
+}
+
+configure_ssh_authentication() {
+    # Define desired SSH configuration as key-value pairs
+    declare -A ssh_config=(
+        ["PasswordAuthentication"]="yes"
+        ["PermitRootLogin"]="yes"
+        ["PubkeyAuthentication"]="yes"
+        ["UsePAM"]="yes"
+        ["KbdInteractiveAuthentication"]="yes"
+        ["Port"]="22"
+        ["Protocol"]="2"
+    )
+
+    # Iterate through each configuration and update or add it
+    for key in "${!ssh_config[@]}"; do
+        if sudo grep -q "^$key" "$SSH_CONF"; then
+            sudo sed -i "s/^$key .*/$key ${ssh_config[$key]}/" "$SSH_CONF"
+        else
+            echo "$key ${ssh_config[$key]}" | sudo tee -a "$SSH_CONF" > /dev/null
+        fi
+    done
+}
+
+
+generate_ssh_keys() {
+    log "Generating SSH keys if not present..."
+    local key_types=("rsa" "ecdsa" "ed25519")
+    
+    for type in "${key_types[@]}"; do
+        local key_file="/etc/ssh/ssh_host_${type}_key"
+        if [ ! -f "$key_file" ]; then
+            log "Generating $type SSH key..."
+            sudo ssh-keygen -t "$type" -f "$key_file" -N ""
+        fi
+    done
+}
+
+# Function to set up LDAP client
+setup_ldap_client() {
+    log "Setting up LDAP client..."
+    sudo mkdir -p /etc/ldap
+    
+    sudo tee /etc/ldap/ldap.conf <<EOL
+BASE    $LDAP_BASE
+URI     $LDAP_URI
+BINDDN  $LDAP_ADMIN_DN
+TLS_REQCERT allow
+EOL
+}
+
+# Function to set up SSSD
+setup_sssd() {
+    log "Setting up SSSD..."
+    create_sssd_config
+    configure_nss
+    
+    if [ "$PACKAGE_MANAGER" = "pacman" ]; then
+        configure_arch_pam
+    elif [ "$PACKAGE_MANAGER" = "yum" ] && [[ "$OS_VERSION" == "amzn-2023" ]]; then
+        configure_amazon_linux_auth
+    fi
+    
+    sudo systemctl enable sssd
+    sudo systemctl restart sssd
+}
+
+create_sssd_config() {
+    sudo tee "$SSSD_CONF" <<EOL
+[sssd]
+config_file_version = 2
+services = nss, pam, ssh
+domains = LDAP
+
+[domain/LDAP]
+debug_level = 9
+access_provider = ldap
+id_provider = ldap
+auth_provider = ldap
+chpass_provider = ldap
+ldap_uri = $LDAP_URI
+ldap_search_base = $LDAP_BASE
+ldap_default_bind_dn = $LDAP_ADMIN_DN
+ldap_default_authtok = $LDAP_ADMIN_PW
+ldap_tls_reqcert = never
+cache_credentials = true
+enumerate = true
+ldap_id_use_start_tls = false
+ldap_tls_cacert = $CA_CERT
+ldap_user_object_class = posixAccount
+ldap_group_object_class = posixGroup
+ldap_user_home_directory = homeDirectory
+ldap_user_shell = loginShell
+ldap_user_uid = uid
+ldap_user_name = uid
+ignore_missing_attributes = True
+ldap_access_order = filter
+ldap_access_filter = (objectClass=posixAccount)
+ldap_user_ssh_public_key = sshPublicKey
+ldap_auth_disable_tls_never_use_in_production = true
+ldap_group_name = cn
+EOL
+    sudo chmod 600 "$SSSD_CONF"
+}
+
+configure_nss() {
+    sudo tee /etc/nsswitch.conf <<EOL
+passwd: files sss
+shadow: files sss
+group:  files sss
+hosts: files dns myhostname
+EOL
+}
+
+configure_arch_pam() {
+    echo "Configuring PAM for Arch Linux..."
+    
+    # Configure PAM for SSSD
+    sudo tee /etc/pam.d/system-auth <<EOL
+#%PAM-1.0
+auth     sufficient pam_sss.so forward_pass
+auth     required  pam_unix.so try_first_pass nullok
+auth     optional  pam_permit.so
+
+account  sufficient pam_sss.so
+account  required  pam_unix.so
+account  optional  pam_permit.so
+
+password sufficient pam_sss.so use_authtok
+password required  pam_unix.so try_first_pass nullok sha512 shadow
+password optional  pam_permit.so
+
+session  required  pam_limits.so
+session  required  pam_unix.so
+session  optional  pam_sss.so
+session  required  pam_mkhomedir.so skel=/etc/skel umask=0077
+EOL
+
+    # Configure PAM for SSHD
+    sudo tee /etc/pam.d/sshd <<EOL
+#%PAM-1.0
+auth     include  system-auth
+account  include  system-auth
+password include  system-auth
+session  include  system-auth
+EOL
+}
+
+
+configure_amazon_linux_auth() {
+    sudo authselect select sssd --force
+    sudo authselect enable-feature with-mkhomedir
+}
+
+# Function to set up TLS
+setup_tls() {
+    log "Setting up TLS..."
+    echo "$CA_CERT_CONTENT" | sudo tee /etc/ssl/certs/ca-cert.pem > /dev/null
+    sudo chmod 644 /etc/ssl/certs/ca-cert.pem
+    
+    update_ca_certificates
+}
+
+update_ca_certificates() {
+    log "Updating CA certificates..."
+    case $PACKAGE_MANAGER in
+        apt)    sudo update-ca-certificates ;;
+        yum)    sudo update-ca-trust extract ;;
+        pacman) sudo update-ca-trust ;;
+    esac
+}
+
+configure_pam_mkhomedir() {
+    echo "Configuring PAM for SSHD to enable pam_mkhomedir..."
+    PAM_FILE="/etc/pam.d/sshd"
+
+    if ! sudo grep -q "pam_mkhomedir.so" "$PAM_FILE"; then
+        echo "Adding pam_mkhomedir.so configuration to $PAM_FILE..."
+        echo "session required pam_mkhomedir.so skel=/etc/skel umask=0077" | sudo tee -a "$PAM_FILE"
+    else
+        echo "pam_mkhomedir.so is already configured in $PAM_FILE. Skipping."
+    fi
+}
+
+# Main execution
+main() {
+    log "Starting system setup..."
+    
+    # Detect system configuration
     PACKAGE_MANAGER=$(detect_package_manager)
-    echo "Detected package manager: $PACKAGE_MANAGER"
-
-    if [ "$PACKAGE_MANAGER" == "apt" ]; then
-        echo "Installing necessary packages using apt..."
-        apt-get update
-        DEBIAN_FRONTEND=noninteractive apt-get install -y libnss-ldapd libpam-ldap ldap-utils nscd
-    elif [ "$PACKAGE_MANAGER" == "yum" ]; then
-        echo "Installing necessary packages using yum..."
-        yum install -y nss-pam-ldapd nscd openldap-clients
-    elif [ "$PACKAGE_MANAGER" == "pacman" ]; then
-        echo "Installing necessary packages using pacman..."
-        pacman -Sy --noconfirm nss-pam-ldapd openldap nscd
+    OS_VERSION=$(detect_os_version)
+    log "Detected package manager: $PACKAGE_MANAGER"
+    log "Detected OS version: $OS_VERSION"
+    
+    # Install necessary packages
+    install_packages "$PACKAGE_MANAGER"
+    
+    # Set up services
+    setup_ssh
+    setup_ldap_client
+    setup_sssd
+    setup_tls
+    configure_pam_mkhomedir
+    
+    # Additional setup for Arch Linux
+    if [ "$PACKAGE_MANAGER" = "pacman" ]; then
+        sudo systemctl enable --now sssd
+        sudo systemctl enable --now sshd
+        sudo sss_cache -E
+        sudo rm -rf /var/lib/sss/db/*
+        sudo systemctl restart sssd
     fi
+    
+    log "Setup completed successfully."
 }
 
-# Configure LDAP settings for APT-based systems
-function configure_ldap_apt() {
-    echo "Configuring LDAP settings for APT-based system..."
-    BASE_DN=$(get_base_dn)
-    LDAP_URI="ldap://ldap"
-    BIND_DN="cn=admin,$BASE_DN"
-
-    # Use LDAP admin password from environment variable
-    if [ -z "$LDAP_ADMIN_PASSWORD" ]; then
-        echo "LDAP_ADMIN_PASSWORD environment variable is not set. Exiting..."
-        exit 1
-    fi
-    BIND_PASSWORD=$LDAP_ADMIN_PASSWORD
-
-    echo "Setting up debconf selections for LDAP..."
-    cat <<EOF | debconf-set-selections
-libnss-ldapd libnss-ldapd/binddn string $BIND_DN
-libnss-ldapd libnss-ldapd/bindpw password $BIND_PASSWORD
-libnss-ldapd libnss-ldapd/rootbinddn string $BIND_DN
-libnss-ldapd libnss-ldapd/dbrootlogin boolean true
-libnss-ldapd libnss-ldapd/override boolean true
-libnss-ldapd libnss-ldapd/ldap_version select 3
-libnss-ldapd libnss-ldapd/dblogin boolean false
-libpam-ldap libpam-ldap/binddn string $BIND_DN
-libpam-ldap libpam-ldap/bindpw password $BIND_PASSWORD
-libpam-ldap libpam-ldap/base string $BASE_DN
-libpam-ldap libpam-ldap/ldap_version select 3
-libpam-ldap shared/ldapns/ldap-server string $LDAP_URI
-libpam-ldap libpam-ldap/dbrootlogin boolean true
-libpam-ldap libpam-ldap/rootbinddn string $BIND_DN
-libpam-ldap libpam-ldap/override boolean true
-libpam-ldap libpam-ldap/dblogin boolean false
-EOF
-
-    dpkg-reconfigure -f noninteractive libnss-ldapd
-    dpkg-reconfigure -f noninteractive libpam-ldap
-}
-
-# Configure LDAP settings for YUM-based systems
-function configure_ldap_yum() {
-    echo "Configuring LDAP settings for YUM-based system..."
-    BASE_DN=$(get_base_dn)
-    LDAP_URI="ldap://ldap"
-
-    # Use LDAP admin password from environment variable
-    if [ -z "$LDAP_ADMIN_PASSWORD" ]; then
-        echo "LDAP_ADMIN_PASSWORD environment variable is not set. Exiting..."
-        exit 1
-    fi
-    BIND_PASSWORD=$LDAP_ADMIN_PASSWORD
-
-    echo "Creating /etc/nslcd.conf..."
-    echo "URI $LDAP_URI
-BASE $BASE_DN
-BINDDN cn=admin,$BASE_DN
-BINDPW $BIND_PASSWORD
-" > /etc/nslcd.conf
-
-    authconfig --enableldap --enableldapauth --ldapserver=$LDAP_URI --ldapbasedn=$BASE_DN --enablemkhomedir --update
-}
-
-# Configure LDAP settings for Pacman-based systems
-function configure_ldap_pacman() {
-    echo "Configuring LDAP settings for Pacman-based system..."
-    BASE_DN=$(get_base_dn)
-    LDAP_URI="ldap://ldap"
-    BIND_DN="cn=admin,$BASE_DN"
-
-    # Use LDAP admin password from environment variable
-    if [ -z "$LDAP_ADMIN_PASSWORD" ]; then
-        echo "LDAP_ADMIN_PASSWORD environment variable is not set. Exiting..."
-        exit 1
-    fi
-    BIND_PASSWORD=$LDAP_ADMIN_PASSWORD
-
-    echo "Creating /etc/nslcd.conf..."
-    echo "uri $LDAP_URI
-base $BASE_DN
-binddn $BIND_DN
-bindpw $BIND_PASSWORD
-" > /etc/nslcd.conf
-
-    systemctl enable nslcd
-    systemctl start nslcd
-}
-
-# Configure NSS and PAM
-function configure_nss_pam() {
-    echo "Configuring NSS..."
-    sed -i '/^passwd:/ s/$/ ldap/' /etc/nsswitch.conf
-    sed -i '/^group:/ s/$/ ldap/' /etc/nsswitch.conf
-    sed -i '/^shadow:/ s/$/ ldap/' /etc/nsswitch.conf
-
-    echo "Configuring PAM..."
-    if [ "$(detect_package_manager)" == "apt" ]; then
-        pam-auth-update --enable mkhomedir
-    elif [ "$(detect_package_manager)" == "yum" ]; then
-        authconfig --enablemkhomedir --update
-    elif [ "$(detect_package_manager)" == "pacman" ]; then
-        echo "session required        pam_mkhomedir.so skel=/etc/skel umask=0077" >> /etc/pam.d/common-session
-    fi
-}
-
-# Restart necessary services
-function restart_services() {
-    echo "Restarting services..."
-    systemctl restart nscd
-}
-
-# Main script execution
-echo "Installing packages..."
-install_packages
-
-if [ "$(detect_package_manager)" == "apt" ]; then
-    configure_ldap_apt
-elif [ "$(detect_package_manager)" == "yum" ]; then
-    configure_ldap_yum
-elif [ "$(detect_package_manager)" == "pacman" ]; then
-    configure_ldap_pacman
-fi
-
-configure_nss_pam
-restart_services
-
-echo "LDAP SSO configuration is complete."
+# Execute main function
+main
